@@ -1,6 +1,8 @@
 # Fork-only workflow (lenstrats/PineTS, branch `patched`).
 # Keeps `patched` = LuxAlgo/PineTS `dev` + our fixes: merges upstream `dev`, builds, runs the test suite,
-# and only pushes when all of that passes. On a merge conflict or a failing build/test it opens an issue.
+# and only pushes when all of that passes. Then it publishes the build output to the `patched-dist`
+# branch, which npm and bun can install without building. On a merge conflict or a failing
+# build/test it opens an issue.
 name: Sync upstream dev into patched
 
 on:
@@ -9,7 +11,7 @@ on:
     workflow_dispatch:
         inputs:
             force_test:
-                description: 'Build and test even when upstream has no new commits'
+                description: 'Build, test and publish patched-dist even when upstream has no new commits'
                 type: boolean
                 default: false
 
@@ -24,6 +26,8 @@ concurrency:
 jobs:
     sync:
         runs-on: ubuntu-latest
+        env:
+            RUN_ALL: ${{ inputs.force_test || false }}
         steps:
             - name: Checkout patched
               uses: actions/checkout@v4
@@ -48,23 +52,66 @@ jobs:
                   fi
 
             - name: Setup Node.js
-              if: steps.merge.outputs.new != '0' || inputs.force_test
+              if: steps.merge.outputs.new != '0' || env.RUN_ALL == 'true'
               uses: actions/setup-node@v4
               with:
                   node-version: 22
                   cache: npm
 
             - name: Install and build
-              if: steps.merge.outputs.new != '0' || inputs.force_test
+              if: steps.merge.outputs.new != '0' || env.RUN_ALL == 'true'
               run: npm ci # also runs the `prepare` build
 
-            - name: Test
-              if: steps.merge.outputs.new != '0' || inputs.force_test
-              run: npm test -- --run
+            # These test files need live Binance data. Binance answers GitHub's US-hosted runners with
+            # HTTP 451 (restricted location), so they can only fail here. They pass locally and keep running there.
+            - name: Test (without live-market-data tests)
+              if: steps.merge.outputs.new != '0' || env.RUN_ALL == 'true'
+              run: |
+                  npm test -- --run \
+                      --exclude tests/core/pinescript.test.ts \
+                      --exclude tests/core/pagination.test.ts \
+                      --exclude tests/core/udt-method-mutation.test.ts \
+                      --exclude tests/indicators/Institutional_Bias.test.ts \
+                      --exclude tests/marketData/symbolInfo.test.ts \
+                      --exclude tests/namespaces/array/access.test.ts \
+                      --exclude tests/namespaces/array/calculations.test.ts \
+                      --exclude tests/namespaces/barstate.test.ts \
+                      --exclude tests/namespaces/math/basic-operations.test.ts \
+                      --exclude tests/namespaces/math/statistical.test.ts \
+                      --exclude tests/namespaces/request.test.ts \
+                      --exclude tests/namespaces/request-cross-tf.test.ts \
+                      --exclude tests/namespaces/ta/moving-averages.test.ts \
+                      --exclude tests/namespaces/ta/oscillators-momentum.test.ts \
+                      --exclude tests/namespaces/ta/statistical-functions.test.ts \
+                      --exclude tests/namespaces/ta/support-resistance.test.ts \
+                      --exclude tests/namespaces/ta/volatility-range.test.ts
 
-            - name: Push
+            - name: Push patched
               if: steps.merge.outputs.new != '0'
               run: git push origin HEAD:patched
+
+            - name: Publish prebuilt branch patched-dist
+              if: steps.merge.outputs.new != '0' || env.RUN_ALL == 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  src=$(git rev-parse --short HEAD)
+                  out=$(mktemp -d)
+                  mkdir -p "$out/dist"
+                  cp dist/*.min.* "$out/dist/"
+                  rm -f "$out"/dist/*.map
+                  cp -r dist/types "$out/dist/types"
+                  cp LICENSE "$out/"
+                  # Installable package without build step: drop scripts (incl. prepare) and devDependencies.
+                  node -e 'const p = require("./package.json"); delete p.scripts; delete p.devDependencies; require("fs").writeFileSync(process.argv[1], JSON.stringify(p, null, 4) + "\n")' "$out/package.json"
+                  printf '# PineTS (patched, prebuilt)\n\nBuild output of the `patched` branch of https://github.com/lenstrats/PineTS (commit %s), which is LuxAlgo/PineTS `dev` plus fixes that are not merged upstream yet.\n\nInstall with `npm install github:lenstrats/PineTS#patched-dist` or `bun add github:lenstrats/PineTS#patched-dist`.\n\nSource, the list of fixes and license (AGPL-3.0): see the `patched` branch. This branch is regenerated automatically; do not commit to it.\n' "$src" > "$out/README.md"
+                  cd "$out"
+                  git init -q -b patched-dist
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  git add -A
+                  git commit -q -m "Build of patched $src"
+                  git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" patched-dist
 
             - name: Open issue on failure
               if: failure()

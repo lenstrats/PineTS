@@ -36,9 +36,9 @@
 > | `label.set_text_font_family`, `label.set_text_formatting`, `text_formatting` in `label.new` | [#306](https://github.com/LuxAlgo/PineTS/pull/306) |
 > | `table.cell_set_text_formatting`, `text_formatting` in `table.cell` | [#307](https://github.com/LuxAlgo/PineTS/pull/307) |
 >
-> **Install:** `npm install github:lenstrats/PineTS#patched` (it builds on install), or clone this branch, run `npm install`, and depend on it with `"pinets": "file:../PineTS"`. This branch is not published to npm.
+> **Install** (prebuilt, no build step): `npm install github:lenstrats/PineTS#patched-dist` or `bun add github:lenstrats/PineTS#patched-dist`. You can also clone this branch, run `npm install` (which builds `dist/`), and depend on it with `"pinets": "file:../PineTS"`. None of this is published to npm.
 >
-> Once a week a GitHub Action merges upstream `dev` into this branch. It only pushes if the build and tests pass; otherwise it opens an issue. The fixes were checked against 729 TradingView community indicators with [lenstrats/pinets-compat](https://github.com/lenstrats/pinets-compat). The license is unchanged: AGPL-3.0 (see [License](#license)).
+> Once a week a GitHub Action merges upstream `dev` into this branch and runs the build and tests. If everything passes, it pushes the merge and regenerates `patched-dist`; if not, it opens an issue. On GitHub's runners it skips the 17 test files that need live Binance data, because Binance blocks those runners. The fixes were checked against 729 TradingView community indicators with [lenstrats/pinets-compat](https://github.com/lenstrats/pinets-compat). The license is unchanged: AGPL-3.0 (see [License](#license)).
 
 ## What is PineTS?
 
