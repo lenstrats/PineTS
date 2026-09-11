@@ -26,6 +26,20 @@
   <a href="#charting-with-vela">Vela</a>
 </p>
 
+> [!NOTE]
+> **This is the `patched` branch of [lenstrats/PineTS](https://github.com/lenstrats/PineTS), a fork of [LuxAlgo/PineTS](https://github.com/LuxAlgo/PineTS).**
+> It is LuxAlgo's `dev` branch plus fixes that have been submitted upstream but are not merged yet:
+>
+> | Fix | Upstream PR |
+> |---|---|
+> | `scale.*` and `settlement_as_close.*` resolve in scripts | [#305](https://github.com/LuxAlgo/PineTS/pull/305) |
+> | `label.set_text_font_family`, `label.set_text_formatting`, `text_formatting` in `label.new` | [#306](https://github.com/LuxAlgo/PineTS/pull/306) |
+> | `table.cell_set_text_formatting`, `text_formatting` in `table.cell` | [#307](https://github.com/LuxAlgo/PineTS/pull/307) |
+>
+> **Install:** `npm install github:lenstrats/PineTS#patched` (it builds on install), or clone this branch, run `npm install`, and depend on it with `"pinets": "file:../PineTS"`. This branch is not published to npm.
+>
+> Once a week a GitHub Action merges upstream `dev` into this branch. It only pushes if the build and tests pass; otherwise it opens an issue. The fixes were checked against 729 TradingView community indicators with [lenstrats/pinets-compat](https://github.com/lenstrats/pinets-compat). The license is unchanged: AGPL-3.0 (see [License](#license)).
+
 ## What is PineTS?
 
 PineTS is a TypeScript runtime for [Pine Script®](https://www.TradingView.com/pine-script-docs/welcome/). It transpiles native v6 or v5 source and executes it with the same time series model: lookbacks, incremental TA, and plot outputs you can read from code.

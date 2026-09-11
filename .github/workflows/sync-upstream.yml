@@ -1,0 +1,77 @@
+# Fork-only workflow (lenstrats/PineTS, branch `patched`).
+# Keeps `patched` = LuxAlgo/PineTS `dev` + our fixes: merges upstream `dev`, builds, runs the test suite,
+# and only pushes when all of that passes. On a merge conflict or a failing build/test it opens an issue.
+name: Sync upstream dev into patched
+
+on:
+    schedule:
+        - cron: '0 6 * * 1' # Mondays 06:00 UTC
+    workflow_dispatch:
+        inputs:
+            force_test:
+                description: 'Build and test even when upstream has no new commits'
+                type: boolean
+                default: false
+
+permissions:
+    contents: write
+    issues: write
+
+concurrency:
+    group: sync-upstream
+    cancel-in-progress: false
+
+jobs:
+    sync:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout patched
+              uses: actions/checkout@v4
+              with:
+                  ref: patched
+                  fetch-depth: 0
+
+            - name: Merge upstream dev
+              id: merge
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  git remote add upstream https://github.com/LuxAlgo/PineTS.git
+                  git fetch upstream dev
+                  new=$(git rev-list --count HEAD..upstream/dev)
+                  echo "new=$new" >> "$GITHUB_OUTPUT"
+                  echo "Upstream dev has $new new commit(s)"
+                  if [ "$new" -gt 0 ] && ! git merge --no-ff upstream/dev -m "Merge upstream dev into patched"; then
+                      git merge --abort
+                      echo "conflict=true" >> "$GITHUB_OUTPUT"
+                      exit 1
+                  fi
+
+            - name: Setup Node.js
+              if: steps.merge.outputs.new != '0' || inputs.force_test
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
+
+            - name: Install and build
+              if: steps.merge.outputs.new != '0' || inputs.force_test
+              run: npm ci # also runs the `prepare` build
+
+            - name: Test
+              if: steps.merge.outputs.new != '0' || inputs.force_test
+              run: npm test -- --run
+
+            - name: Push
+              if: steps.merge.outputs.new != '0'
+              run: git push origin HEAD:patched
+
+            - name: Open issue on failure
+              if: failure()
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  CONFLICT: ${{ steps.merge.outputs.conflict || 'false' }}
+              run: |
+                  gh issue create --repo "$GITHUB_REPOSITORY" \
+                      --title "Upstream sync failed ($(date -u +%Y-%m-%d))" \
+                      --body "Merging LuxAlgo/PineTS \`dev\` into \`patched\` failed (merge conflict: $CONFLICT). Nothing was pushed. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
