@@ -412,7 +412,7 @@ let src_open = input.any({ title: 'Open Source', defval: open });
   const p9 = ta.param(14, undefined, 'p9');
   const temp_5 = ta.ema(p8, p9, "_ta4");
   $.const.glb1_tr4 = $.init($.const.glb1_tr4, temp_5);
-  const p10 = ta.param($.let.glb1__cc, aa[99], 'p10');
+  const p10 = ta.param($.let.glb1__cc, $.get($.let.glb1_aa, 99), 'p10');
   const p11 = ta.param(14, undefined, 'p11');
   const temp_6 = ta.ema(p10, p11, "_ta5");
   $.const.glb1_tr5 = $.init($.const.glb1_tr5, temp_6);
@@ -544,8 +544,8 @@ let src_open = input.any({ title: 'Open Source', defval: open });
   const p4 = ta.param($.let.glb1_leftBars, undefined, 'p4');
   const p5 = ta.param($.let.glb1_rightBars, undefined, 'p5');
   const temp_3 = ta.pivothigh(p4, p5, "_ta2");
-  const p6 = $.param(temp_3, 1, 'p6');
-  $.let.glb1_highUsePivot = $.init($.let.glb1_highUsePivot, fixnan(p6));
+  const p7 = $.param($.get($.param(temp_3, undefined, 'p6'), 1), undefined, 'p7');
+  $.let.glb1_highUsePivot = $.init($.let.glb1_highUsePivot, fixnan(p7));
 }`;
 
         expect(result).toBe(expected_code);
@@ -1168,7 +1168,7 @@ let src_open = input.any({ title: 'Open Source', defval: open });
     return $.precision([[$.get($$.const.fn1_oo, 0), $.get($$.const.fn1_cc, 0)]]);
   }
   {
-    $.const.glb1_temp_1 = $.init($.const.glb1_temp_1, $.call(foo, "_fn0"));
+    $.const.glb1_temp_1 = $.init($.const.glb1_temp_1, $.toTuple($.call(foo, "_fn0"), 2));
     $.const.glb1_res = $.init($.const.glb1_res, $.get($.const.glb1_temp_1, 0)[0]);
     $.const.glb1_data = $.init($.const.glb1_data, $.get($.const.glb1_temp_1, 0)[1]);
   }
