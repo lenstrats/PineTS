@@ -71,6 +71,7 @@ async function generateIndex() {
 // Run: npm run generate:array-index
 
 ${objectImports}
+import { tostringElements } from './format';
 
 ${pineArrayTypeEnum}
 
@@ -81,8 +82,13 @@ ${objectPrivateProps}
 ${objectInitProps}
     }
 
+    // Element count for JavaScript callers (PineTS syntax: \`line.all.length\`); Pine uses size().
+    get length(): number {
+        return this.array.length;
+    }
+
     toString(): string {
-        return '[' + this.array.toString().replace(/,/g, ', ') + ']';
+        return '[' + tostringElements(this).join(', ') + ']';
     }
 
     [Symbol.iterator]() {
