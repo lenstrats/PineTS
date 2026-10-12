@@ -1,0 +1,63 @@
+{
+    "name": "pinets",
+    "version": "0.11.0",
+    "description": "Run Pine Script anywhere. PineTS is an open-source transpiler and runtime that brings Pine Script logic to Node.js and the browser with 1:1 syntax compatibility. Reliably write, port, and run indicators or strategies on your own infrastructure.",
+    "keywords": [
+        "Pine Script",
+        "Pine",
+        "PineScript transpiler",
+        "PineScript runtime",
+        "PineScript to JavaScript",
+        "PineScript to TypeScript",
+        "TradingView",
+        "Quant",
+        "Quantitative Finance",
+        "Trading",
+        "Technical Analysis",
+        "TA",
+        "Indicator",
+        "Strategy",
+        "Backtesting",
+        "Forecasting",
+        "Machine Learning",
+        "Data Science",
+        "Data Analysis",
+        "Data Visualization",
+        "Data Mining"
+    ],
+    "main": "dist/pinets.min.cjs",
+    "module": "dist/pinets.min.es.js",
+    "browser": "dist/pinets.min.browser.es.js",
+    "types": "dist/types/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/types/index.d.ts",
+            "node": {
+                "import": "./dist/pinets.min.es.js",
+                "require": "./dist/pinets.min.cjs"
+            },
+            "browser": {
+                "import": "./dist/pinets.min.browser.es.js",
+                "default": "./dist/pinets.min.browser.js"
+            },
+            "default": "./dist/pinets.min.es.js"
+        }
+    },
+    "files": [
+        "dist/*.min.*",
+        "dist/types"
+    ],
+    "type": "module",
+    "author": "LuxAlgo",
+    "license": "AGPL-3.0-only",
+    "dependencies": {
+        "acorn": "^8.14.0",
+        "acorn-walk": "^8.3.4",
+        "astring": "^1.9.0"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/LuxAlgo/PineTS.git"
+    },
+    "homepage": "https://www.luxalgo.com/pinets"
+}
