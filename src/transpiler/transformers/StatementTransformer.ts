@@ -22,8 +22,9 @@ import {
 /**
  * Creates the AST nodes for a loop guard:
  * 1. A counter declaration: `let __lgN = 0;` (to be hoisted before the loop)
- * 2. A guard check: `if (++__lgN > __maxLoops) throw new Error("Loop exceeded maximum iterations (__lgN)");`
- *    (to be prepended to the loop body)
+ * 2. A guard check: `if (++__lgN > __maxLoops) $.loopError("Loop exceeded maximum iterations (__lgN)");`
+ *    (to be prepended to the loop body). `$.loopError` throws a PineRuntimeError
+ *    so a host can tell a loop-limit kill from a general engine error.
  */
 export function createLoopGuardNodes(guardName: string): { counterDecl: any; guardCheck: any } {
     // let __lgN = 0;
@@ -55,10 +56,17 @@ export function createLoopGuardNodes(guardName: string): { counterDecl: any; gua
             right: { type: 'Identifier', name: '__maxLoops' },
         },
         consequent: {
-            type: 'ThrowStatement',
-            argument: {
-                type: 'NewExpression',
-                callee: { type: 'Identifier', name: 'Error' },
+            // `$.loopError(...)` throws a PineRuntimeError (never returns), so the
+            // loop-limit kill is distinguishable from a general engine error.
+            type: 'ExpressionStatement',
+            expression: {
+                type: 'CallExpression',
+                callee: {
+                    type: 'MemberExpression',
+                    object: { type: 'Identifier', name: '$' },
+                    property: { type: 'Identifier', name: 'loopError' },
+                    computed: false,
+                },
                 arguments: [{
                     type: 'Literal',
                     value: `Loop exceeded maximum iterations (${guardName})`,
@@ -129,6 +137,34 @@ export function transformAssignmentExpression(node: any, scopeManager: ScopeMana
         }
     }
 
+    // A switch / multi-line `if` expression on the right of `:=` compiles to an IIFE. Its arms need the
+    // same transformation as in a declaration initializer; the walk below does not enter IIFE bodies, and
+    // the generic traversal that does leaves built-in series (`close`) and `a.b.c` chains untransformed.
+    // Loop expressions keep the generic traversal, which injects their loop guards.
+    const transformIIFEs = (n: any): void => {
+        if (!n) return;
+        if (n.type === 'CallExpression' && (n.callee?.type === 'ArrowFunctionExpression' || n.callee?.type === 'FunctionExpression')) {
+            const body = n.callee.body?.type === 'BlockStatement' ? n.callee.body.body : [];
+            const isLoopExpression = body.some((s: any) => /^(For|ForOf|ForIn|While|DoWhile)Statement$/.test(s.type));
+            if (!isLoopExpression) {
+                walkInitExpression(n, scopeManager);
+                n._iifeTransformed = true;
+            }
+            return;
+        }
+        if (n.type === 'BinaryExpression' || n.type === 'LogicalExpression') {
+            transformIIFEs(n.left);
+            transformIIFEs(n.right);
+        } else if (n.type === 'ConditionalExpression') {
+            transformIIFEs(n.test);
+            transformIIFEs(n.consequent);
+            transformIIFEs(n.alternate);
+        } else if (n.type === 'UnaryExpression') {
+            transformIIFEs(n.argument);
+        }
+    };
+    transformIIFEs(node.right);
+
     // Transform identifiers in the right side of the assignment
     walk.recursive(
         node.right,
@@ -197,6 +233,7 @@ export function transformAssignmentExpression(node: any, scopeManager: ScopeMana
                 }
             },
             CallExpression(node: any, state: any, c: any) {
+                if (node._iifeTransformed) return;
                 const isNamespaceCall =
                     node.callee &&
                     node.callee.type === 'MemberExpression' &&
@@ -251,6 +288,241 @@ export function transformAssignmentExpression(node: any, scopeManager: ScopeMana
 
         Object.assign(node, setCall);
     }
+}
+
+/**
+ * Transform the identifiers, calls and IIFEs (switch / multi-line `if` expressions) of an initializer
+ * expression in place. Also used for the right side of `:=` when it holds an IIFE.
+ */
+export function walkInitExpression(expr: any, scopeManager: ScopeManager): void {
+    // Add parent references for proper function call detection
+    walk.recursive(
+        expr,
+        { parent: expr },
+        {
+            Identifier(node: any, state: any) {
+                node.parent = state.parent;
+                transformIdentifier(node, scopeManager);
+
+                const isBinaryOperation = node.parent && node.parent.type === 'BinaryExpression';
+                const isUnaryOperation = node.parent && node.parent.type === 'UnaryExpression';
+                const isConditional = node.parent && node.parent.type === 'ConditionalExpression';
+                const isGetCall =
+                    node.parent &&
+                    node.parent.type === 'CallExpression' &&
+                    node.parent.callee &&
+                    node.parent.callee.object &&
+                    node.parent.callee.object.name === CONTEXT_NAME &&
+                    node.parent.callee.property.name === 'get';
+
+                if (node.type === 'Identifier' && (isBinaryOperation || isUnaryOperation || isConditional) && !isGetCall) {
+                    addArrayAccess(node, scopeManager);
+                }
+            },
+            CallExpression(node: any, state: any, c: any) {
+                // Set parent for the function name
+                if (node.callee.type === 'Identifier') {
+                    node.callee.parent = node;
+                }
+                // Set parent for arguments
+                node.arguments.forEach((arg: any) => {
+                    if (arg.type === 'Identifier') {
+                        arg.parent = node;
+                    }
+                });
+
+                // If the callee is an IIFE (ArrowFunctionExpression or FunctionExpression), traverse it
+                if (node.callee.type === 'ArrowFunctionExpression' || node.callee.type === 'FunctionExpression') {
+                    c(node.callee, { parent: node });
+                }
+
+                transformCallExpression(node, scopeManager);
+
+                if (node.type !== 'CallExpression' || isInlinedLazyCall(node)) return;
+
+                // Traverse the callee if it's a MemberExpression (to handle obj.method())
+                if (node.callee.type === 'MemberExpression') {
+                    c(node.callee, { parent: node });
+                }
+
+                // Continue walking the arguments
+                node.arguments.forEach((arg) => c(arg, { parent: node }));
+            },
+            BinaryExpression(node: any, state: any, c: any) {
+                // Set parent references for operands
+                if (node.left.type === 'Identifier') {
+                    node.left.parent = node;
+                }
+                if (node.right.type === 'Identifier') {
+                    node.right.parent = node;
+                }
+                // Transform both operands
+                c(node.left, { parent: node });
+                c(node.right, { parent: node });
+            },
+            // LogicalExpression (`and`/`or`) and UnaryExpression
+            // (`not`/unary `-`) need explicit visitors here so the
+            // parent reference threaded into their children is the
+            // expression itself — not the surrounding decl.init.
+            // Without this, an Identifier inside `not a and not b`
+            // sees state.parent === LogicalExpression instead of
+            // UnaryExpression, the "unwrap as series-operand" path
+            // never fires, and the JS emits `!a && !b` (always
+            // false because `a`/`b` are Series objects).
+            LogicalExpression(node: any, state: any, c: any) {
+                if (node.left.type === 'Identifier') node.left.parent = node;
+                if (node.right.type === 'Identifier') node.right.parent = node;
+                c(node.left, { parent: node });
+                c(node.right, { parent: node });
+            },
+            UnaryExpression(node: any, state: any, c: any) {
+                if (node.argument.type === 'Identifier') node.argument.parent = node;
+                c(node.argument, { parent: node });
+            },
+            MemberExpression(node: any, state: any, c: any) {
+                // Set parent reference
+                if (node.object && node.object.type === 'Identifier') {
+                    node.object.parent = node;
+                }
+                if (node.property && node.property.type === 'Identifier') {
+                    node.property.parent = node;
+                }
+                // Transform array indices first
+                transformMemberExpression(node, '', scopeManager);
+                // Then continue with object transformation
+                if (node.type === 'CallExpression') {
+                    node.arguments.forEach((arg: any) => c(arg, { parent: node }));
+                } else if (node.object) {
+                    c(node.object, { parent: node });
+                }
+            },
+            AwaitExpression(node: any, state: any, c: any) {
+                // Mark the argument as being inside an await
+                if (node.argument) {
+                    node.argument._insideAwait = true;
+
+                    // Transform the argument
+                    c(node.argument, { parent: node });
+
+                    // After transformation, if the argument was hoisted and is now an identifier,
+                    // remove the await since it's already in the hoisted statement
+                    if (node.argument.type === 'Identifier' && node.argument._wasInsideAwait) {
+                        // Replace the AwaitExpression with just the identifier
+                        Object.assign(node, node.argument);
+                    }
+                }
+            },
+            ArrowFunctionExpression(node: any, state: any, c: any) {
+                // For IIFE arrow functions, manage hoisting like BlockStatement does
+                // This prevents hoisted statements from escaping to the outer scope
+                if (node.body) {
+                    if (node.body.type === 'BlockStatement') {
+                        // Process each statement with its own hoisting scope
+                        const newBody: any[] = [];
+                        node.body.body.forEach((stmt: any) => {
+                            scopeManager.enterHoistingScope();
+                            c(stmt, { parent: node.body, insideIIFE: true });
+                            const hoistedStmts = scopeManager.exitHoistingScope();
+                            newBody.push(...hoistedStmts);
+                            newBody.push(stmt);
+                        });
+                        node.body.body = newBody;
+                    } else {
+                        // For expression body, traverse the expression
+                        c(node.body, { parent: node, insideIIFE: true });
+                    }
+                }
+            },
+            FunctionExpression(node: any, state: any, c: any) {
+                // For IIFE function expressions, manage hoisting like BlockStatement does
+                if (node.body && node.body.type === 'BlockStatement') {
+                    const newBody: any[] = [];
+                    node.body.body.forEach((stmt: any) => {
+                        scopeManager.enterHoistingScope();
+                        c(stmt, { parent: node.body, insideIIFE: true });
+                        const hoistedStmts = scopeManager.exitHoistingScope();
+                        newBody.push(...hoistedStmts);
+                        newBody.push(stmt);
+                    });
+                    node.body.body = newBody;
+                }
+            },
+            BlockStatement(node: any, state: any, c: any) {
+                // Nested blocks inside an IIFE (the `if`/`else` bodies that a Pine
+                // `switch` or multi-line `if` expression compiles to) need their own
+                // per-statement hoisting scope, exactly like the IIFE body above and
+                // the BlockStatement handlers of the return-statement / arrow-body
+                // walkers. Without it, `if (c) { return array.get(a, 0) }` hoists the
+                // `array.get` temp to the IIFE body, ahead of the `if`, so the untaken
+                // branch is evaluated anyway (and throws on an empty array).
+                const newBody: any[] = [];
+                node.body.forEach((stmt: any) => {
+                    scopeManager.enterHoistingScope();
+                    c(stmt, { ...state, parent: node });
+                    const hoistedStmts = scopeManager.exitHoistingScope();
+                    newBody.push(...hoistedStmts);
+                    newBody.push(stmt);
+                });
+                node.body = newBody;
+            },
+            SwitchStatement(node: any, state: any, c: any) {
+                // Traverse discriminant and all cases
+                if (node.discriminant) {
+                    node.discriminant.parent = node;
+                    c(node.discriminant, { parent: node });
+                }
+                if (node.cases) {
+                    node.cases.forEach((caseNode: any) => {
+                        caseNode.parent = node;
+                        // Preserve `insideIIFE`: a `switch` used as an expression is
+                    // emitted as an IIFE, so `:=` assignments in its arms are inside
+                    // the IIFE and must still be rewritten to `$.set(...)`. Dropping
+                    // the flag here left them as bare `name = …`, which leaks a host
+                    // global instead of updating the Pine variable.
+                    c(caseNode, { parent: node, insideIIFE: state.insideIIFE });
+                    });
+                }
+            },
+            SwitchCase(node: any, state: any, c: any) {
+                // Traverse test (the case value)
+                if (node.test) {
+                    node.test.parent = node;
+                    c(node.test, { parent: node, insideIIFE: state.insideIIFE });
+                }
+                // Traverse all consequent statements with hoisting management
+                if (node.consequent) {
+                    const newConsequent: any[] = [];
+                    node.consequent.forEach((stmt: any) => {
+                        scopeManager.enterHoistingScope();
+                        stmt.parent = node;
+                        c(stmt, { parent: node, insideIIFE: state.insideIIFE });
+                        const hoistedStmts = scopeManager.exitHoistingScope();
+                        newConsequent.push(...hoistedStmts);
+                        newConsequent.push(stmt);
+                    });
+                    node.consequent = newConsequent;
+                }
+            },
+            AssignmentExpression(node: any, state: any, c: any) {
+                // Only transform assignment expressions inside IIFEs (e.g., while/for-as-expression)
+                // Don't transform assignments used as sub-expressions in normal initializers
+                // (e.g., let result = (val = 10) + 5 — the (val = 10) must remain a JS assignment)
+                if (!state.insideIIFE) return;
+
+                // Skip local IIFE variables (like __result) that aren't registered Pine Script vars
+                if (node.left.type === 'Identifier') {
+                    const [scopedName] = scopeManager.getVariable(node.left.name);
+                    if (scopedName === node.left.name && !scopeManager.isContextBound(node.left.name)) {
+                        // Unknown local variable — don't transform the assignment,
+                        // but still traverse the right-hand side for identifier transformations
+                        c(node.right, { parent: node });
+                        return;
+                    }
+                }
+                transformAssignmentExpression(node, scopeManager);
+            },
+        }
+    );
 }
 
 export function transformVariableDeclaration(varNode: any, scopeManager: ScopeManager): void {
@@ -367,229 +639,7 @@ export function transformVariableDeclaration(varNode: any, scopeManager: ScopeMa
                 // Transform the function call arguments
                 transformCallExpression(decl.init, scopeManager);
             } else {
-                // Add parent references for proper function call detection
-                walk.recursive(
-                    decl.init,
-                    { parent: decl.init },
-                    {
-                        Identifier(node: any, state: any) {
-                            node.parent = state.parent;
-                            transformIdentifier(node, scopeManager);
-
-                            const isBinaryOperation = node.parent && node.parent.type === 'BinaryExpression';
-                            const isUnaryOperation = node.parent && node.parent.type === 'UnaryExpression';
-                            const isConditional = node.parent && node.parent.type === 'ConditionalExpression';
-                            const isGetCall =
-                                node.parent &&
-                                node.parent.type === 'CallExpression' &&
-                                node.parent.callee &&
-                                node.parent.callee.object &&
-                                node.parent.callee.object.name === CONTEXT_NAME &&
-                                node.parent.callee.property.name === 'get';
-
-                            if (node.type === 'Identifier' && (isBinaryOperation || isUnaryOperation || isConditional) && !isGetCall) {
-                                addArrayAccess(node, scopeManager);
-                            }
-                        },
-                        CallExpression(node: any, state: any, c: any) {
-                            // Set parent for the function name
-                            if (node.callee.type === 'Identifier') {
-                                node.callee.parent = node;
-                            }
-                            // Set parent for arguments
-                            node.arguments.forEach((arg: any) => {
-                                if (arg.type === 'Identifier') {
-                                    arg.parent = node;
-                                }
-                            });
-
-                            // If the callee is an IIFE (ArrowFunctionExpression or FunctionExpression), traverse it
-                            if (node.callee.type === 'ArrowFunctionExpression' || node.callee.type === 'FunctionExpression') {
-                                c(node.callee, { parent: node });
-                            }
-
-                            transformCallExpression(node, scopeManager);
-
-                            if (node.type !== 'CallExpression' || isInlinedLazyCall(node)) return;
-
-                            // Traverse the callee if it's a MemberExpression (to handle obj.method())
-                            if (node.callee.type === 'MemberExpression') {
-                                c(node.callee, { parent: node });
-                            }
-
-                            // Continue walking the arguments
-                            node.arguments.forEach((arg) => c(arg, { parent: node }));
-                        },
-                        BinaryExpression(node: any, state: any, c: any) {
-                            // Set parent references for operands
-                            if (node.left.type === 'Identifier') {
-                                node.left.parent = node;
-                            }
-                            if (node.right.type === 'Identifier') {
-                                node.right.parent = node;
-                            }
-                            // Transform both operands
-                            c(node.left, { parent: node });
-                            c(node.right, { parent: node });
-                        },
-                        // LogicalExpression (`and`/`or`) and UnaryExpression
-                        // (`not`/unary `-`) need explicit visitors here so the
-                        // parent reference threaded into their children is the
-                        // expression itself — not the surrounding decl.init.
-                        // Without this, an Identifier inside `not a and not b`
-                        // sees state.parent === LogicalExpression instead of
-                        // UnaryExpression, the "unwrap as series-operand" path
-                        // never fires, and the JS emits `!a && !b` (always
-                        // false because `a`/`b` are Series objects).
-                        LogicalExpression(node: any, state: any, c: any) {
-                            if (node.left.type === 'Identifier') node.left.parent = node;
-                            if (node.right.type === 'Identifier') node.right.parent = node;
-                            c(node.left, { parent: node });
-                            c(node.right, { parent: node });
-                        },
-                        UnaryExpression(node: any, state: any, c: any) {
-                            if (node.argument.type === 'Identifier') node.argument.parent = node;
-                            c(node.argument, { parent: node });
-                        },
-                        MemberExpression(node: any, state: any, c: any) {
-                            // Set parent reference
-                            if (node.object && node.object.type === 'Identifier') {
-                                node.object.parent = node;
-                            }
-                            if (node.property && node.property.type === 'Identifier') {
-                                node.property.parent = node;
-                            }
-                            // Transform array indices first
-                            transformMemberExpression(node, '', scopeManager);
-                            // Then continue with object transformation
-                            if (node.type === 'CallExpression') {
-                                node.arguments.forEach((arg: any) => c(arg, { parent: node }));
-                            } else if (node.object) {
-                                c(node.object, { parent: node });
-                            }
-                        },
-                        AwaitExpression(node: any, state: any, c: any) {
-                            // Mark the argument as being inside an await
-                            if (node.argument) {
-                                node.argument._insideAwait = true;
-
-                                // Transform the argument
-                                c(node.argument, { parent: node });
-
-                                // After transformation, if the argument was hoisted and is now an identifier,
-                                // remove the await since it's already in the hoisted statement
-                                if (node.argument.type === 'Identifier' && node.argument._wasInsideAwait) {
-                                    // Replace the AwaitExpression with just the identifier
-                                    Object.assign(node, node.argument);
-                                }
-                            }
-                        },
-                        ArrowFunctionExpression(node: any, state: any, c: any) {
-                            // For IIFE arrow functions, manage hoisting like BlockStatement does
-                            // This prevents hoisted statements from escaping to the outer scope
-                            if (node.body) {
-                                if (node.body.type === 'BlockStatement') {
-                                    // Process each statement with its own hoisting scope
-                                    const newBody: any[] = [];
-                                    node.body.body.forEach((stmt: any) => {
-                                        scopeManager.enterHoistingScope();
-                                        c(stmt, { parent: node.body, insideIIFE: true });
-                                        const hoistedStmts = scopeManager.exitHoistingScope();
-                                        newBody.push(...hoistedStmts);
-                                        newBody.push(stmt);
-                                    });
-                                    node.body.body = newBody;
-                                } else {
-                                    // For expression body, traverse the expression
-                                    c(node.body, { parent: node, insideIIFE: true });
-                                }
-                            }
-                        },
-                        FunctionExpression(node: any, state: any, c: any) {
-                            // For IIFE function expressions, manage hoisting like BlockStatement does
-                            if (node.body && node.body.type === 'BlockStatement') {
-                                const newBody: any[] = [];
-                                node.body.body.forEach((stmt: any) => {
-                                    scopeManager.enterHoistingScope();
-                                    c(stmt, { parent: node.body, insideIIFE: true });
-                                    const hoistedStmts = scopeManager.exitHoistingScope();
-                                    newBody.push(...hoistedStmts);
-                                    newBody.push(stmt);
-                                });
-                                node.body.body = newBody;
-                            }
-                        },
-                        BlockStatement(node: any, state: any, c: any) {
-                            // Nested blocks inside an IIFE (the `if`/`else` bodies that a Pine
-                            // `switch` or multi-line `if` expression compiles to) need their own
-                            // per-statement hoisting scope, exactly like the IIFE body above and
-                            // the BlockStatement handlers of the return-statement / arrow-body
-                            // walkers. Without it, `if (c) { return array.get(a, 0) }` hoists the
-                            // `array.get` temp to the IIFE body, ahead of the `if`, so the untaken
-                            // branch is evaluated anyway (and throws on an empty array).
-                            const newBody: any[] = [];
-                            node.body.forEach((stmt: any) => {
-                                scopeManager.enterHoistingScope();
-                                c(stmt, { ...state, parent: node });
-                                const hoistedStmts = scopeManager.exitHoistingScope();
-                                newBody.push(...hoistedStmts);
-                                newBody.push(stmt);
-                            });
-                            node.body = newBody;
-                        },
-                        SwitchStatement(node: any, state: any, c: any) {
-                            // Traverse discriminant and all cases
-                            if (node.discriminant) {
-                                node.discriminant.parent = node;
-                                c(node.discriminant, { parent: node });
-                            }
-                            if (node.cases) {
-                                node.cases.forEach((caseNode: any) => {
-                                    caseNode.parent = node;
-                                    c(caseNode, { parent: node });
-                                });
-                            }
-                        },
-                        SwitchCase(node: any, state: any, c: any) {
-                            // Traverse test (the case value)
-                            if (node.test) {
-                                node.test.parent = node;
-                                c(node.test, { parent: node });
-                            }
-                            // Traverse all consequent statements with hoisting management
-                            if (node.consequent) {
-                                const newConsequent: any[] = [];
-                                node.consequent.forEach((stmt: any) => {
-                                    scopeManager.enterHoistingScope();
-                                    stmt.parent = node;
-                                    c(stmt, { parent: node });
-                                    const hoistedStmts = scopeManager.exitHoistingScope();
-                                    newConsequent.push(...hoistedStmts);
-                                    newConsequent.push(stmt);
-                                });
-                                node.consequent = newConsequent;
-                            }
-                        },
-                        AssignmentExpression(node: any, state: any, c: any) {
-                            // Only transform assignment expressions inside IIFEs (e.g., while/for-as-expression)
-                            // Don't transform assignments used as sub-expressions in normal initializers
-                            // (e.g., let result = (val = 10) + 5 — the (val = 10) must remain a JS assignment)
-                            if (!state.insideIIFE) return;
-
-                            // Skip local IIFE variables (like __result) that aren't registered Pine Script vars
-                            if (node.left.type === 'Identifier') {
-                                const [scopedName] = scopeManager.getVariable(node.left.name);
-                                if (scopedName === node.left.name && !scopeManager.isContextBound(node.left.name)) {
-                                    // Unknown local variable — don't transform the assignment,
-                                    // but still traverse the right-hand side for identifier transformations
-                                    c(node.right, { parent: node });
-                                    return;
-                                }
-                            }
-                            transformAssignmentExpression(node, scopeManager);
-                        },
-                    }
-                );
+                walkInitExpression(decl.init, scopeManager);
             }
         }
 
@@ -790,6 +840,7 @@ export function transformVariableDeclaration(varNode: any, scopeManager: ScopeMa
 
 export function transformForStatement(node: any, scopeManager: ScopeManager, c: any): void {
     scopeManager.setSuppressHoisting(true);
+    scopeManager.setInLoopTest(true);
     // Handle initialization
     if (node.init && node.init.type === 'VariableDeclaration') {
         // Keep the original loop variable name
@@ -956,6 +1007,7 @@ export function transformForStatement(node: any, scopeManager: ScopeManager, c: 
 
     // Transform the loop body
     scopeManager.setSuppressHoisting(false);
+    scopeManager.setInLoopTest(false);
 
     // Inject loop guard: hoist counter declaration before the loop
     const forGuardName = scopeManager.getNextLoopGuardName();
@@ -966,10 +1018,13 @@ export function transformForStatement(node: any, scopeManager: ScopeManager, c: 
     c(node.body, scopeManager);
     scopeManager.popScope();
 
-    // Prepend guard check as the first statement in the loop body
-    if (node.body.type === 'BlockStatement') {
-        node.body.body.unshift(forGuard.guardCheck);
+    // Prepend guard check as the first statement in the loop body. A braceless
+    // single-statement body (reachable only via PineTS-syntax input; native Pine
+    // always emits block bodies) is wrapped first so it is guarded too.
+    if (node.body.type !== 'BlockStatement') {
+        node.body = { type: 'BlockStatement', body: [node.body] };
     }
+    node.body.body.unshift(forGuard.guardCheck);
 
     // Clean up loop variable so it doesn't leak to outer scope
     // (prevents shadowing issues when the same name is reused later)
@@ -983,6 +1038,7 @@ export function transformWhileStatement(node: any, scopeManager: ScopeManager, c
     // While-loop test conditions must NOT be hoisted — they're re-evaluated each iteration.
     // Suppress hoisting so namespace calls like array.size() stay inline.
     scopeManager.setSuppressHoisting(true);
+    scopeManager.setInLoopTest(true);
 
     // Transform the test condition like an `if` test (series identifiers read with $.get,
     // `na(x)` / namespace calls lowered once), with the calls kept inline.
@@ -991,6 +1047,7 @@ export function transformWhileStatement(node: any, scopeManager: ScopeManager, c
     }
 
     scopeManager.setSuppressHoisting(false);
+    scopeManager.setInLoopTest(false);
 
     // Inject loop guard: hoist counter declaration before the loop
     const whileGuardName = scopeManager.getNextLoopGuardName();
@@ -1002,10 +1059,12 @@ export function transformWhileStatement(node: any, scopeManager: ScopeManager, c
     c(node.body, scopeManager);
     scopeManager.popScope();
 
-    // Prepend guard check as the first statement in the loop body
-    if (node.body.type === 'BlockStatement') {
-        node.body.body.unshift(whileGuard.guardCheck);
+    // Prepend guard check as the first statement in the loop body. A braceless
+    // body (PineTS-syntax only) is wrapped first so it is guarded too.
+    if (node.body.type !== 'BlockStatement') {
+        node.body = { type: 'BlockStatement', body: [node.body] };
     }
+    node.body.body.unshift(whileGuard.guardCheck);
 }
 
 export function transformExpression(node: any, scopeManager: ScopeManager): void {
