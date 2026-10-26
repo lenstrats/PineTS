@@ -2,7 +2,8 @@
 
 import { Series } from '../Series';
 import { PineTypeObject } from './PineTypeObject';
-import { parseArgsForPineParams } from './utils';
+import { extractCallsiteId, parseArgsForPineParams } from './utils';
+import { spreadNamedArgs } from './namedArgs';
 import type { IndicatorOptions, PlotCharOptions } from '../types/PineTypes';
 import { silentInSecondary } from './silentInSecondary';
 
@@ -67,6 +68,9 @@ export function parseIndicatorOptions(args: any[]): Partial<IndicatorOptions> {
     return parseArgsForPineParams<Partial<IndicatorOptions>>(args, INDICATOR_SIGNATURE, INDICATOR_ARGS_TYPES);
 }
 
+const LIBRARY_SIGNATURE = ['title', 'overlay', 'dynamic_requests'];
+const LIBRARY_ARGS_TYPES = { title: 'string', overlay: 'boolean', dynamic_requests: 'boolean' };
+
 /**
  * NAHelper implements the dual-use `na` identifier.
  * - Bare `na` → `na.__value` → NaN
@@ -111,6 +115,9 @@ export const ALERT_FREQ = {
     freq_once_per_bar_close: 'once_per_bar_close',
 };
 
+const ALERT_PARAMS = ['message', 'freq'];
+const ALERTCONDITION_PARAMS = ['condition', 'title', 'message'];
+
 /**
  * AlertHelper implements the dual-use `alert` identifier.
  * - `alert(msg, freq)` → `alert.any(msg, freq, {__callsiteId})` — fires an alert event
@@ -144,7 +151,9 @@ export class AlertHelper {
     }
 
     @silentInSecondary
-    any(message: any, freq?: any, opts?: any): void {
+    any(...args: any[]): void {
+        const injectedCallsiteId = extractCallsiteId(args);
+        const [message, freq] = spreadNamedArgs(args, ALERT_PARAMS);
         const msg = Series.from(message).get(0);
         // Earlier PineTS versions used 'alert.freq_all', ...: accept those strings too.
         const given = freq ? Series.from(freq).get(0) : ALERT_FREQ.freq_once_per_bar;
@@ -152,8 +161,8 @@ export class AlertHelper {
 
         // Extract callsite ID: from transpiler-injected __callsiteId, or fallback counter
         let callsiteId: string;
-        if (opts && typeof opts === 'object' && opts.__callsiteId) {
-            callsiteId = opts.__callsiteId;
+        if (injectedCallsiteId) {
+            callsiteId = injectedCallsiteId;
         } else {
             const execTick = this.context._execTick || 0;
             if (execTick !== this._fallbackLastExecTick) {
@@ -240,6 +249,12 @@ export class Core {
         return this.context.indicator;
     }
 
+    // A library run on its own executes its global code, as an indicator would.
+    library(...args) {
+        const unwrapped = args.map((a) => (a instanceof Series ? a.get(0) : a));
+        return this.indicator(parseArgsForPineParams<Partial<IndicatorOptions>>(unwrapped, LIBRARY_SIGNATURE, LIBRARY_ARGS_TYPES));
+    }
+
     get bar_index() {
         return this.context.idx;
     }
@@ -272,7 +287,8 @@ export class Core {
     private _acFiredKeys: Set<string> = new Set();
 
     @silentInSecondary
-    alertcondition(condition: any, title?: any, message?: any) {
+    alertcondition(...args: any[]) {
+        const [condition, title, message] = spreadNamedArgs(args, ALERTCONDITION_PARAMS);
         const cond = Series.from(condition).get(0);
 
         const barIdx = this.context.idx;

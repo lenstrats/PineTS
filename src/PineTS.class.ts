@@ -6,7 +6,9 @@ import { splitTickerModifier, withTickerModifier } from './tickerModifier';
 import { createSyminfo } from './namespaces/Syminfo';
 import { Series } from './Series';
 import { Indicator } from './Indicator';
-import { processBarOrders, barPath, beginStrategyBar, riskStartBar, processOrdersOnClose, processMarginCall, finalizeStrategyBar, finalizeStrategyRun, applyPendingCloseMarginCall, snapshotStrategyState, restoreStrategyState, snapToTick } from './namespaces/strategy/utils';
+import { toImportResolver } from './imports/Function/FunctionImportResolver.class';
+import type { IImportResolver, ImportResolverFn } from './imports/IImportResolver';
+import { processBarOrders, barPath, beginStrategyBar, riskStartBar, riskAtBarClose, processOrdersOnClose, processMarginCall, finalizeStrategyBar, finalizeStrategyRun, applyPendingCloseMarginCall, snapshotStrategyState, restoreStrategyState, snapToTick } from './namespaces/strategy/utils';
 
 import { parseTimeframe, timeframeSeconds } from './timeframe';
 
@@ -66,8 +68,13 @@ export class PineTS {
     private _currentIndicator: Indicator | null = null;
 
     private _isSecondaryContext: boolean = false;
-    public markAsSecondary() {
+    /**
+     * Mark this instance as the secondary context of a `request.*` call.
+     * It inherits what its parent runs with: the import resolver.
+     */
+    public markAsSecondary(parent?: Context) {
         this._isSecondaryContext = true;
+        if (parent) this._importResolver = parent.importResolver;
     }
 
     private _syminfo: ISymbolInfo;
@@ -122,6 +129,21 @@ export class PineTS {
      */
     public setAlertMode(mode: 'realtime' | 'all') {
         this._alertMode = mode;
+    }
+
+    private _importResolver: IImportResolver | null = null;
+
+    /**
+     * Set where the libraries of `import <user>/<library>/<version> [as alias]`
+     * statements come from: an import resolver (`ImportResolver.GitHub`,
+     * `new FileImportResolver({ dir })`, ...), or a plain function
+     * `(path, info) => source | null`, which is wrapped in a `FunctionImportResolver`.
+     * Resolvers cache what they resolve, so a library is fetched once per
+     * resolver, across runs and `request.security` contexts.
+     * @param resolver An import resolver or function; `null` removes it
+     */
+    public setImportResolver(resolver: IImportResolver | ImportResolverFn | null) {
+        this._importResolver = resolver == null ? null : toImportResolver(resolver);
     }
 
     // ── Visible-range / host environment ────────────────────────────────
@@ -466,6 +488,7 @@ export class PineTS {
         const context = this._initializeContext(null as any, inputs, this._isSecondaryContext);
         context.pineVersion = (transpiledFn as any)._pineVersion ?? null;
         this._transpiledCode = transpiledFn;
+        context.transpiledFn = transpiledFn;
         // Preserve slice attribution on the context so any nested LTF
         // request inside the slice can keep using the same map.
         const slices = (transpiledFn as any)._ltfSlices;
@@ -490,12 +513,14 @@ export class PineTS {
         await this.ready();
         if (!periods) periods = this.data.length;
 
+        await ind.resolveImports(this._importResolver);
         const prepared = ind.prepare(this._debugSettings);
         this._usesVisibleRange = prepared.usesVisibleRange;
 
         const context = this._initializeContext(ind.source ?? null as any, prepared.inputs, this._isSecondaryContext);
         context.pineVersion = (prepared.fn as any)._pineVersion ?? null;
         this._transpiledCode = prepared.fn;
+        context.transpiledFn = prepared.fn;
         // Propagate transpile-time slices (one per request.security_lower_tf
         // call site) onto the Context so the slow path of the LTF runtime
         // can pick the right truncated body to run in the secondary
@@ -536,12 +561,14 @@ export class PineTS {
         await this.ready();
         if (!periods) periods = this.data.length;
 
+        await ind.resolveImports(this._importResolver);
         const prepared = ind.prepare(this._debugSettings);
         this._usesVisibleRange = prepared.usesVisibleRange;
 
         const context = this._initializeContext(ind.source ?? null as any, prepared.inputs, this._isSecondaryContext);
         context.pineVersion = (prepared.fn as any)._pineVersion ?? null;
         this._transpiledCode = prepared.fn;
+        context.transpiledFn = prepared.fn;
         if (prepared.ltfSlices) (context as any)._ltfTruncatedBodies = prepared.ltfSlices;
 
         const startIdx = this.data.length - periods;
@@ -1049,8 +1076,9 @@ export class PineTS {
                         if (item.data.length > snapInfo.len) {
                             item.data.length = snapInfo.len;
                         }
-                        // Restore the last value (which may have been modified in-place)
-                        if (snapInfo.len > 0 && snapInfo.lastVal !== undefined) {
+                        // Restore the last value (which may have been modified in-place).
+                        // A `varip` keeps the value the discarded execution left in it.
+                        if (snapInfo.len > 0 && snapInfo.lastVal !== undefined && !item.varip) {
                             item.data[snapInfo.len - 1] = snapInfo.lastVal;
                         }
                     }
@@ -1120,6 +1148,7 @@ export class PineTS {
         context.__maxLoops = this._maxLoops;
         context._alertMode = this._alertMode;
         context._fillsOnTickGrid = this._fillsOnTickGrid;
+        context.importResolver = this._importResolver;
 
         // User-explicit prop overrides flow from the Indicator to the runtime.
         // Read by Core.indicator() and initializeStrategy/strategy.any() to
@@ -1310,7 +1339,9 @@ export class PineTS {
             // A scheduled phantom close call takes its place.
             if (context.strategy) {
                 const rawBar = this._snapBarForBroker(context);
+                riskAtBarClose(context);
                 if (!(context.strategy as any)._pending_close_mc) processMarginCall(context, 'close');
+                riskAtBarClose(context);
                 processOrdersOnClose(context);
                 if (rawBar) this._restoreRawBar(context, rawBar);
             }

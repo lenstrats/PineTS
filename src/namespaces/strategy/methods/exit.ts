@@ -5,6 +5,7 @@ import { Order } from '../types';
 import { Series } from '../../../Series';
 import { parseArgsForPineParams, extractCallsiteId } from '../../utils';
 import { roundToMintick, roundOrderLevel, parseDirection, placeOrder, floorQty, trailArmPrice } from '../utils';
+import { checkExitLegs, checkQtyPercent } from '../validation';
 
 /**
  * Pine signature (21 named args):
@@ -58,6 +59,7 @@ export function exit(context: any) {
         extractCallsiteId(args);
 
         const parsed = parseArgsForPineParams<any>(args, EXIT_SIGNATURES, EXIT_ARGS_TYPES);
+        checkExitLegs(parsed);
 
         const extractValue = (val: any) => {
             if (val === undefined || val === null) return val;
@@ -105,6 +107,8 @@ export function exit(context: any) {
         // (TradingView, BTCUSDT 1h / AAPL 1D: `strategy.exit("x", "D", ...)` called once just before
         // `strategy.entry("D", ...)` never fires, 0 / 74).
         if (fromEntryId && !pendingEntry && !(context.strategy.opentrades as any[]).some((t) => t.entry_id === fromEntryId)) return;
+        // `qty_percent` is only checked when `qty` does not override it
+        if (qty === undefined || qty === null || isNaValue(qty)) checkQtyPercent('strategy.exit', qtyPercent);
 
         // Limit / stop levels go on the mintick grid by the exit's side, as entry levels do (TV, AAPL
         // 1D: a short's stop at 53.4925 placed with the close at 53.5425 works at 53.50). Without a
@@ -156,6 +160,7 @@ export function exit(context: any) {
             from_entry: fromEntryId,
             profit, loss, limit, stop,
             trail_price: trailPrice,
+            _trailPriceRaw: trailPriceRaw,
             trail_points: trailPoints,
             trail_offset: trailOffset,
             oca_name: extractValue(parsed.oca_name),
@@ -179,13 +184,14 @@ export function exit(context: any) {
         };
 
         // Trail state carry-over: each trade's armed flag and running peak are
-        // engine-accumulated state, not user parameters. When the user calls
-        // strategy.exit every bar (the canonical "persistent" pattern), naive
-        // replacement would reset them every bar, preventing the trail from
-        // ever accumulating beyond a single bar's range. TV's trail state
-        // persists across re-calls — only the user-tunable parameters
-        // (trail_points, trail_offset, limit, stop, etc.) are refreshed.
-        const trails = replaced.find((o) => o._trailByTrade);
+        // engine-accumulated state, not user parameters. A re-call with the same
+        // activation (trail_price as passed, trail_points) keeps them, whatever else
+        // changes (offset, loss, ...). A re-call that moves the activation is a new
+        // trailing order that starts over (TV, BTCUSDT 1h: `trail_price = close`
+        // re-called every bar exits a long at the previous close minus the offset,
+        // 78,979.99, not at the previous high minus the offset, 79,020.61). The
+        // passed value is compared: its tick rounding follows the close.
+        const trails = replaced.find((o) => o._trailByTrade && o._trailPriceRaw === trailPriceRaw && o.trail_points === trailPoints);
         if (trails) order._trailByTrade = { ...trails._trailByTrade };
         // A trail whose activation level the close has already reached is active from that close,
         // with the close as its peak (TV, ES: a short's trail activating at 2,013 placed on a 1,994.5
